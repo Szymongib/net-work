@@ -2,25 +2,47 @@ extern crate core;
 
 use std::env::args;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
+use anyhow::Context;
 use tokio::net::{TcpListener, TcpSocket};
 use rand::{CryptoRng, RngCore};
 use snow::params::NoiseParams;
+use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = anyhow::Result<T>;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
 
-    if args().len() < 2 {
-        println!("need at least one argument - port");
-        exit(1)
+    if args().len() < 3 {
+        return Err(anyhow::Error::msg("need at least two arguments - key_path, port"))
     }
 
+    let mut args = args().skip(1).collect::<Vec<String>>();
+
+    let key_path: PathBuf = PathBuf::from(&args[0]);
+    let mut pub_key_path = PathBuf::from(format!("{}.pub", key_path.as_os_str().to_str().unwrap()));
+
+    let keypair = if !key_path.exists() || !pub_key_path.exists() {
+        println!("Keys not found, generating...");
+        let keypair = generate_noise_keys().context("failed to generate key pair")?;
+
+        fs::write(key_path, &keypair.private).await.context("failed to save private key")?;
+        fs::write(pub_key_path, &keypair.public).await.context("failed to save public key")?;
+        keypair
+    } else {
+        let privkey = fs::read(key_path).await.context("failed to read private key")?;
+        let pubkey = fs::read(pub_key_path).await.context("failed to read public key")?;
+
+        snow::Keypair{ private: privkey, public: pubkey }
+    };
+
+
     // Skip arg 0
-    let listen_port = args().skip(1).next().unwrap();
+    let listen_port = args[1].clone();
     println!("Listen port: {}", listen_port);
 
     let handle = tokio::spawn(async move {
@@ -28,16 +50,18 @@ async fn main() {
         run_listener(&port).await
     });
 
-    if args().len() < 3 {
+    if args.len() < 3 {
         println!("Listening, not connecting...");
         handle.await.expect("failed while waiting for listener task");
-        return;
+        return Ok(());
     }
 
     println!("Peer address provided, connecting...");
-    let peer_addr = args().skip(2).next().unwrap();
+    let peer_addr = &args[2];
 
-    connect_to_peer(&peer_addr).await;
+    connect_to_peer(peer_addr).await;
+
+    Ok(())
 }
 
 // If I would like to deterministically generate Key Pari from password, what I could do is:
@@ -102,16 +126,16 @@ fn generate_key_pair() -> ed25519_dalek::Keypair {
     return keypair
 }
 
-pub struct Context {
-    tx: tokio::sync::mpsc::Sender<bool>,
-}
-
-impl Context {
-    pub async fn stop(&mut self) -> Result<()> {
-        self.tx.send(true).await?;
-        Ok(())
-    }
-}
+// pub struct Context {
+//     tx: tokio::sync::mpsc::Sender<bool>,
+// }
+//
+// impl Context {
+//     pub async fn stop(&mut self) -> Result<()> {
+//         self.tx.send(true).await?;
+//         Ok(())
+//     }
+// }
 
 #[cfg(test)]
 mod tests {

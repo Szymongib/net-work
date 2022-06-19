@@ -5,12 +5,10 @@ extern crate core;
 use std::env::args;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::exit;
 use std::str::FromStr;
 use std::time::Duration;
 use anyhow::Context;
 use tokio::net::{TcpListener, TcpSocket};
-use rand::{CryptoRng, RngCore};
 use snow::params::NoiseParams;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,10 +26,10 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::Error::msg("need at least two arguments - key_path, port"));
     }
 
-    let mut args = args().skip(1).collect::<Vec<String>>();
+    let args = args().skip(1).collect::<Vec<String>>();
 
     let key_path: PathBuf = PathBuf::from(&args[0]);
-    let mut pub_key_path = PathBuf::from(format!("{}.pub", key_path.as_os_str().to_str().unwrap()));
+    let pub_key_path = PathBuf::from(format!("{}.pub", key_path.as_os_str().to_str().unwrap()));
 
     let keypair = if !key_path.exists() || !pub_key_path.exists() {
         println!("Keys not found, generating...");
@@ -89,40 +87,14 @@ fn clone_keypair(keypair: &snow::Keypair) -> snow::Keypair {
 // - Perhaps there is some simpler version of that, that 3 words would be enough
 
 async fn connect_to_peer(peer_addr: &str, keypair: snow::Keypair) {
-    let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
-    let mut noise =
-        builder.local_private_key(&keypair.private).
-            psk(3, PSK.as_bytes()).
-            build_initiator().unwrap();
-
     let mut buf = vec![0u8; 65535];
 
-    // So this is handled internally - the struct noise maintains the state of the handshake,
-    // therefore it knows what to write to the buffer next.
-    // -> e - sending the ephemeral key
-    let len = noise.write_message(&[], &mut buf).unwrap();
-    let pub_ephemeral_key = base64::encode(&buf[..len]);
-    println!("Init msg with pub key: {:?}", pub_ephemeral_key);
-
     let sock_addr = SocketAddr::from_str(peer_addr).expect("failed to parse addr");
-    let mut socket = TcpSocket::new_v4().expect("failed to create socket");
+    let socket = TcpSocket::new_v4().expect("failed to create socket");
     let mut tcp_stream = socket.connect(sock_addr).await.expect("failed to connect to peer");
 
-    // -> e
-    send(&mut tcp_stream, &buf[..len]).await;
-
-    // <- e, ee, s, es
-    let msg = recv(&mut tcp_stream).await.expect("failed to received after init");
-    println!("Got after init: {}", base64::encode(&msg));
-    noise.read_message(&msg, &mut buf).unwrap();
-
-    // -> s, se
-    let len = noise.write_message(&[], &mut buf).unwrap();
-    println!("Sending next msg: {}", base64::encode(&buf[..len]));
-    send(&mut tcp_stream, &buf[..len]).await;
-
-    let mut noise = noise.into_transport_mode().unwrap();
-    println!("session established client side...");
+    let mut noise = initiator_handshake(&mut tcp_stream, keypair, &mut buf).await
+        .expect("failed to run the handshake");
 
     for i in 0..10 {
         println!("Sending msg {}", i);
@@ -135,71 +107,114 @@ async fn connect_to_peer(peer_addr: &str, keypair: snow::Keypair) {
     // tcp_stream.write_all("HELLO!".as_bytes()).await.expect("Failed to write!");
     // tcp_stream.flush().await.expect("failed to flush");
 
+    // TODO: read something and return it
+
     println!("I WROTE AND I AM OUT!")
 }
 
-async fn initiator_handshake(keypair: snow::Keypair) -> Result<snow::TransportState> {
+async fn initiator_handshake(tcp_stream: &mut tokio::net::TcpStream, keypair: snow::Keypair,buf:  &mut [u8]) -> Result<snow::TransportState> {
+    let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
+    let mut noise =
+        builder.local_private_key(&keypair.private).
+            psk(3, PSK.as_bytes()).
+            build_initiator().unwrap();
 
+    // So this is handled internally - the struct noise maintains the state of the handshake,
+    // therefore it knows what to write to the buffer next.
+    // -> e - sending the ephemeral key
+    let len = noise.write_message(&[], buf).unwrap();
+    let pub_ephemeral_key = base64::encode(&buf[..len]);
+    println!("Init msg with pub key: {:?}", pub_ephemeral_key);
+
+    // -> e
+    send(tcp_stream, &buf[..len]).await;
+
+    // <- e, ee, s, es
+    let msg = recv(tcp_stream).await.expect("failed to received after init");
+    println!("Got after init: {}", base64::encode(&msg));
+    noise.read_message(&msg, buf).unwrap();
+
+    // -> s, se
+    let len = noise.write_message(&[], buf).unwrap();
+    println!("Sending next msg: {}", base64::encode(&buf[..len]));
+    send(tcp_stream, &buf[..len]).await;
+
+    let noise = noise.into_transport_mode().unwrap();
+    println!("session established client side...");
+
+    Ok(noise)
 }
 
 async fn run_listener(port: &str, keypair: snow::Keypair) { // TODO: some way of cancelation
-
-
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
         .await.expect("failed to bind listener");
 
-    // TODO: so how does it work in libp2p? Is every message encrypted?
-
     loop {
-        let mut buf = vec![0u8; 65535];
+        let (stream, addr) = listener.accept().await.expect("failed to accept connection");
 
-        let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
-        let mut noise =
-            builder.local_private_key(&keypair.private)
-                // .remote_public_key()  // TODO: here need to set the remote public key of the peer
-                .psk(3, PSK.as_bytes())
-                .build_responder().unwrap();
-
-        let (mut stream, addr) = listener.accept().await.expect("failed to accept connection");
-
-        println!("GOT CONNECTION FROM: {}", addr);
-
-        // TODO: move to function
-        let init_msg = recv(&mut stream).await.expect("failed to receive init msg");
-        println!("GOT INIT MSG: {}", base64::encode(&init_msg));
-
-        // <- e
-        noise.read_message(&init_msg, &mut buf)
-            .expect("failed to read init msg");
-
-        // -> e, ee, s, es
-        let len = noise.write_message(&[0u8; 0], &mut buf).unwrap();
-        println!("SENDING BACK {} bytes: {}", len, base64::encode(&buf[..len]));
-        // println!("BUFF AFTER: {:?}", &buf[len-5..len+10]);
-        send(&mut stream, &buf[..len]).await;
-
-        // <- s, se
-        let next_msg = recv(&mut stream).await.expect("failed to received next");
-        println!("GOT NEXT MSG: {}", base64::encode(&next_msg));
-        noise.read_message(&next_msg, &mut buf).unwrap();
-
-        // Transition the state machine into transport mode now that the handshake is complete.
-        let mut noise = noise.into_transport_mode().unwrap();
-
-        println!("Session established, server side...");
-
-        while let Ok(msg) = recv(&mut stream).await {
-            let len = noise.read_message(&msg, &mut buf).unwrap();
-            println!("client said: {}", String::from_utf8_lossy(&buf[..len]));
-        }
-
-        // TODO: this should read continously from this
-        // let mut msg = String::new();
-        // stream.read_to_string(&mut msg).await.expect("failed to read");
-
-        // println!("GOT MSG: {}", msg);
-        // TODO: do some processing
+        let kp = clone_keypair(&keypair);
+        tokio::spawn(async move {
+            handle_connection(kp, addr, stream).await;
+        });
     }
+}
+
+async fn handle_connection(keypair: snow::Keypair, peer: SocketAddr, mut stream: tokio::net::TcpStream) {
+    let mut buf = vec![0u8; 65535];
+
+    println!("GOT CONNECTION FROM: {}", peer);
+
+    let mut noise = responder_handshake(&mut stream, keypair, &mut buf)
+        .await
+        .expect("failed to perform responder handshake");
+
+    while let Ok(msg) = recv(&mut stream).await {
+        let len = noise.read_message(&msg, &mut buf).unwrap();
+        println!("client said: {}", String::from_utf8_lossy(&buf[..len]));
+    }
+
+    // TODO: this should read continously from this
+    // let mut msg = String::new();
+    // stream.read_to_string(&mut msg).await.expect("failed to read");
+
+    // println!("GOT MSG: {}", msg);
+    // TODO: do some processing
+}
+
+// TODO: do not panic on errors
+async fn responder_handshake(stream: &mut tokio::net::TcpStream, keypair: snow::Keypair, buf: &mut [u8]) -> Result<snow::TransportState> {
+    let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
+    let mut noise =
+        builder.local_private_key(&keypair.private)
+            // .remote_public_key()  // TODO: here need to set the remote public key of the peer
+            .psk(3, PSK.as_bytes())
+            .build_responder().unwrap();
+
+    // TODO: move to function
+    let init_msg = recv(stream).await.expect("failed to receive init msg");
+    println!("GOT INIT MSG: {}", base64::encode(&init_msg));
+
+    // <- e
+    noise.read_message(&init_msg, buf)
+        .expect("failed to read init msg");
+
+    // -> e, ee, s, es
+    let len = noise.write_message(&[0u8; 0], buf).unwrap();
+    println!("SENDING BACK {} bytes: {}", len, base64::encode(&buf[..len]));
+    // println!("BUFF AFTER: {:?}", &buf[len-5..len+10]);
+    send(stream, &buf[..len]).await;
+
+    // <- s, se
+    let next_msg = recv(stream).await.expect("failed to received next");
+    println!("GOT NEXT MSG: {}", base64::encode(&next_msg));
+    noise.read_message(&next_msg, buf).unwrap();
+
+    // Transition the state machine into transport mode now that the handshake is complete.
+    let noise = noise.into_transport_mode().unwrap();
+
+    println!("Session established, server side...");
+
+    Ok(noise)
 }
 
 fn noise_params() -> NoiseParams {
@@ -217,18 +232,18 @@ fn generate_noise_keys() -> Result<snow::Keypair> {
     Ok(static_key)
 }
 
-fn generate_key_pair() -> ed25519_dalek::Keypair {
-    use rand::rngs::OsRng;
-    use ed25519_dalek::Signature;
-
-    let mut csprng = OsRng {};
-    let keypair: ed25519_dalek::Keypair = ed25519_dalek::Keypair::generate(&mut csprng);
-
-    println!("{:?}", keypair.public);
-    println!("{:?}", keypair.secret);
-
-    return keypair;
-}
+// fn generate_key_pair() -> ed25519_dalek::Keypair {
+//     use rand::rngs::OsRng;
+//     use ed25519_dalek::Signature;
+//
+//     let mut csprng = OsRng {};
+//     let keypair: ed25519_dalek::Keypair = ed25519_dalek::Keypair::generate(&mut csprng);
+//
+//     println!("{:?}", keypair.public);
+//     println!("{:?}", keypair.secret);
+//
+//     return keypair;
+// }
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
 async fn recv(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
@@ -266,13 +281,16 @@ async fn send(stream: &mut tokio::net::TcpStream, buf: &[u8]) {
 mod tests {
     use std::time::Duration;
     use tokio::select;
-    use crate::{connect_to_peer, generate_key_pair, generate_noise_keys, run_listener};
-    use crate::Result;
+    use crate::{
+        connect_to_peer,
+        // generate_key_pair,
+        generate_noise_keys,
+        run_listener};
 
-    #[test]
-    fn test_generate_keys() {
-        let keypair = generate_key_pair();
-    }
+    // #[test]
+    // fn test_generate_keys() {
+    //     let keypair = generate_key_pair();
+    // }
 
     #[tokio::test]
     async fn test_server() {

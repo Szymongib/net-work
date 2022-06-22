@@ -12,6 +12,9 @@ use tokio::net::{TcpListener, TcpSocket};
 use snow::params::NoiseParams;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use clap::{App, Arg, Parser, IntoApp};
+use tracing::info;
+use tracing_subscriber;
 
 pub type Result<T> = anyhow::Result<T>;
 
@@ -20,54 +23,83 @@ const PSK: &str = "SECRET_SECRET_SECRET_SECRET_SECR";
 // const PSK: &str = "i don't care for fidget spinners";
 
 
+#[derive(Parser, Debug)]
+pub struct Listen {
+    #[clap(short, long, default_value = "7010")]
+    pub port: String,
+    #[clap(short, long, default_value = "0.0.0.0")]
+    pub addr: String,
+    #[clap(long, forbid_empty_values = true, default_value = "./dev-keys/peer1")]
+    pub priv_key_path: PathBuf,
+    #[clap(long, forbid_empty_values = true, default_value = "./dev-keys/peer1.pub")]
+    pub pub_key_path: PathBuf,
+    #[clap(long, forbid_empty_values = true, required = false)]
+    pub peer_addr: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub enum SubCommand {
+    Listen(Listen),
+}
+
+#[derive(Parser, Debug)]
+pub struct Opts {
+    #[clap(subcommand)]
+    subcmd: SubCommand,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if args().len() < 3 {
-        return Err(anyhow::Error::msg("need at least two arguments - key_path, port"));
+    let opts = Opts::parse();
+    let mut app = Opts::into_app();
+
+    tracing_subscriber::fmt::init();
+
+    match opts.subcmd {
+        SubCommand::Listen(listen_cmd) => {
+            start_peer(listen_cmd).await.expect("failed to start peer")
+        }
     }
 
-    let args = args().skip(1).collect::<Vec<String>>();
+    Ok(())
+}
 
-    let key_path: PathBuf = PathBuf::from(&args[0]);
-    let pub_key_path = PathBuf::from(format!("{}.pub", key_path.as_os_str().to_str().unwrap()));
+async fn start_peer(listen: Listen) -> anyhow::Result<()> {
+    let keypair = prepare_keypair(&listen.priv_key_path, &listen.pub_key_path).await
+        .context("failed to prepare keypair")?;
 
-    let keypair = if !key_path.exists() || !pub_key_path.exists() {
-        println!("Keys not found, generating...");
-        let keypair = generate_noise_keys().context("failed to generate key pair")?;
-
-        fs::write(key_path, &keypair.private).await.context("failed to save private key")?;
-        fs::write(pub_key_path, &keypair.public).await.context("failed to save public key")?;
-        keypair
-    } else {
-        let privkey = fs::read(key_path).await.context("failed to read private key")?;
-        let pubkey = fs::read(pub_key_path).await.context("failed to read public key")?;
-
-        snow::Keypair { private: privkey, public: pubkey }
-    };
-
-
-    // Skip arg 0
-    let listen_port = args[1].clone();
-    println!("Listen port: {}", listen_port);
+    let listen_addr = format!("{}:{}", listen.addr, listen.port);
 
     let listener_keypair = clone_keypair(&keypair);
     let handle = tokio::spawn(async move {
-        let port = listen_port;
-        run_listener(&port, listener_keypair).await
+        let addr = listen_addr;
+        run_listener(&addr, listener_keypair).await
     });
 
-    if args.len() < 3 {
-        println!("Listening, not connecting...");
-        handle.await.expect("failed while waiting for listener task");
-        return Ok(());
+    if let Some(peer) = listen.peer_addr {
+        info!(peer_addr = peer.as_str(), "Peer address provided, connecting...");
+        connect_to_peer(&peer, keypair).await;
     }
 
-    println!("Peer address provided, connecting...");
-    let peer_addr = &args[2];
-
-    connect_to_peer(peer_addr, keypair).await;
+    handle.await.context("failed in listener handle")?;
 
     Ok(())
+}
+
+async fn prepare_keypair(priv_key_path: &PathBuf, pub_key_path: &PathBuf) -> anyhow::Result<snow::Keypair> {
+    if !priv_key_path.exists() || !pub_key_path.exists() {
+        println!("Keys not found, generating...");
+        let keypair = generate_noise_keys().context("failed to generate key pair")?;
+
+        fs::write(priv_key_path, &keypair.private).await.context("failed to save private key")?;
+        fs::write(pub_key_path, &keypair.public).await.context("failed to save public key")?;
+        Ok(keypair)
+    } else {
+        let privkey = fs::read(priv_key_path).await.context("failed to read private key")?;
+        let pubkey = fs::read(pub_key_path).await.context("failed to read public key")?;
+
+        Ok(snow::Keypair { private: privkey, public: pubkey })
+    }
 }
 
 // Keypair does not implement 'Clone' trait
@@ -145,8 +177,10 @@ async fn initiator_handshake(tcp_stream: &mut tokio::net::TcpStream, keypair: sn
     Ok(noise)
 }
 
-async fn run_listener(port: &str, keypair: snow::Keypair) { // TODO: some way of cancelation
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+async fn run_listener(addr: &str, keypair: snow::Keypair) { // TODO: some way of cancelation
+    info!(addr, "Starting listener");
+
+    let listener = TcpListener::bind(addr)
         .await.expect("failed to bind listener");
 
     loop {
@@ -247,11 +281,11 @@ fn generate_noise_keys() -> Result<snow::Keypair> {
 
 /// Hyper-basic stream transport receiver. 16-bit BE size followed by payload.
 async fn recv(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
-    println!("Reading...");
+    // println!("Reading...");
     let mut msg_len_buf = [0u8; 2];
     stream.read_exact(&mut msg_len_buf).await?;
     let msg_len = ((msg_len_buf[0] as usize) << 8) + (msg_len_buf[1] as usize);
-    println!("Expected msg len: {}", msg_len);
+    // println!("Expected msg len: {}", msg_len);
     let mut msg = vec![0u8; msg_len];
     stream.read_exact(&mut msg[..]).await?;
     Ok(msg)
@@ -299,7 +333,7 @@ mod tests {
 
         tokio::spawn(async move {
             select! {
-                () = run_listener("8888", server_keys) => {
+                () = run_listener("0.0.0.0:8888", server_keys) => {
                     panic!("unexpected listener stopped")
                 },
                 () = tokio::time::sleep(Duration::from_secs(10)) => {

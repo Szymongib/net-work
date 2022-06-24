@@ -22,6 +22,10 @@ pub type Result<T> = anyhow::Result<T>;
 const PSK: &str = "SECRET_SECRET_SECRET_SECRET_SECR";
 // const PSK: &str = "i don't care for fidget spinners";
 
+// TODO: next steps:
+// - Support WireGuard like protocol (noise conf)
+// - Passing trusted keys to the CLI
+// - Associating IP/Port with Key?
 
 #[derive(Parser, Debug)]
 pub struct Listen {
@@ -35,6 +39,8 @@ pub struct Listen {
     pub pub_key_path: PathBuf,
     #[clap(long, forbid_empty_values = true, required = false)]
     pub peer_addr: Option<String>,
+    #[clap(long, forbid_empty_values = true, required = false)]
+    pub peer_pub_key_path: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -77,8 +83,13 @@ async fn start_peer(listen: Listen) -> anyhow::Result<()> {
     });
 
     if let Some(peer) = listen.peer_addr {
+        if listen.peer_pub_key_path.is_none() {
+            return Err(anyhow::Error::msg("peer public key path not provided"))
+        }
+        let peer_key = read_key(&listen.peer_pub_key_path.unwrap()).await?;
+
         info!(peer_addr = peer.as_str(), "Peer address provided, connecting...");
-        connect_to_peer(&peer, keypair).await;
+        connect_to_peer(&peer, keypair, &peer_key).await;
     }
 
     handle.await.context("failed in listener handle")?;
@@ -102,6 +113,11 @@ async fn prepare_keypair(priv_key_path: &PathBuf, pub_key_path: &PathBuf) -> any
     }
 }
 
+async fn read_key(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
+    let bytes = fs::read(path).await.context("failed to read key")?;
+    Ok(bytes)
+}
+
 // Keypair does not implement 'Clone' trait
 fn clone_keypair(keypair: &snow::Keypair) -> snow::Keypair {
     return snow::Keypair {
@@ -118,14 +134,14 @@ fn clone_keypair(keypair: &snow::Keypair) -> snow::Keypair {
 // - bip?
 // - Perhaps there is some simpler version of that, that 3 words would be enough
 
-async fn connect_to_peer(peer_addr: &str, keypair: snow::Keypair) {
+async fn connect_to_peer(peer_addr: &str, keypair: snow::Keypair, peer_pub_key: &[u8]) {
     let mut buf = vec![0u8; 65535];
 
     let sock_addr = SocketAddr::from_str(peer_addr).expect("failed to parse addr");
     let socket = TcpSocket::new_v4().expect("failed to create socket");
     let mut tcp_stream = socket.connect(sock_addr).await.expect("failed to connect to peer");
 
-    let mut noise = initiator_handshake(&mut tcp_stream, keypair, &mut buf).await
+    let mut noise = initiator_handshake(&mut tcp_stream, keypair, &mut buf, peer_pub_key).await
         .expect("failed to run the handshake");
 
     for i in 0..10 {
@@ -144,12 +160,16 @@ async fn connect_to_peer(peer_addr: &str, keypair: snow::Keypair) {
     println!("I WROTE AND I AM OUT!")
 }
 
-async fn initiator_handshake(tcp_stream: &mut tokio::net::TcpStream, keypair: snow::Keypair,buf:  &mut [u8]) -> Result<snow::TransportState> {
-    let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
+async fn initiator_handshake(tcp_stream: &mut tokio::net::TcpStream, keypair: snow::Keypair,buf:  &mut [u8], remote_pub: &[u8]) -> Result<snow::TransportState> {
+    let builder: snow::Builder<'_> = snow::Builder::new(noise_params())
+        .local_private_key(&keypair.private)
+        .remote_public_key(remote_pub);
     let mut noise =
-        builder.local_private_key(&keypair.private).
-            psk(3, PSK.as_bytes()).
-            build_initiator().unwrap();
+        builder
+        // builder.local_private_key(&keypair.private)
+            .psk(2, PSK.as_bytes())
+
+            .build_initiator().unwrap();
 
     // So this is handled internally - the struct noise maintains the state of the handshake,
     // therefore it knows what to write to the buffer next.
@@ -167,9 +187,9 @@ async fn initiator_handshake(tcp_stream: &mut tokio::net::TcpStream, keypair: sn
     noise.read_message(&msg, buf).unwrap();
 
     // -> s, se
-    let len = noise.write_message(&[], buf).unwrap();
-    println!("Sending next msg: {}", base64::encode(&buf[..len]));
-    send(tcp_stream, &buf[..len]).await;
+    // let len = noise.write_message(&[], buf).unwrap();
+    // println!("Sending next msg: {}", base64::encode(&buf[..len]));
+    // send(tcp_stream, &buf[..len]).await;
 
     let noise = noise.into_transport_mode().unwrap();
     println!("session established client side...");
@@ -218,30 +238,31 @@ async fn handle_connection(keypair: snow::Keypair, peer: SocketAddr, mut stream:
 // TODO: do not panic on errors
 async fn responder_handshake(stream: &mut tokio::net::TcpStream, keypair: snow::Keypair, buf: &mut [u8]) -> Result<snow::TransportState> {
     let builder: snow::Builder<'_> = snow::Builder::new(noise_params());
+    // TODO: do I need remote pub here too?
     let mut noise =
         builder.local_private_key(&keypair.private)
             // .remote_public_key()  // TODO: here need to set the remote public key of the peer
-            .psk(3, PSK.as_bytes())
+            .psk(2, PSK.as_bytes())
             .build_responder().unwrap();
 
     // TODO: move to function
     let init_msg = recv(stream).await.expect("failed to receive init msg");
     println!("GOT INIT MSG: {}", base64::encode(&init_msg));
 
-    // <- e
+    // <- e, es, s, ss
     noise.read_message(&init_msg, buf)
         .expect("failed to read init msg");
 
-    // -> e, ee, s, es
+    // -> e, ee, se, psk
     let len = noise.write_message(&[0u8; 0], buf).unwrap();
     println!("SENDING BACK {} bytes: {}", len, base64::encode(&buf[..len]));
     // println!("BUFF AFTER: {:?}", &buf[len-5..len+10]);
     send(stream, &buf[..len]).await;
 
     // <- s, se
-    let next_msg = recv(stream).await.expect("failed to received next");
-    println!("GOT NEXT MSG: {}", base64::encode(&next_msg));
-    noise.read_message(&next_msg, buf).unwrap();
+    // let next_msg = recv(stream).await.expect("failed to received next");
+    // println!("GOT NEXT MSG: {}", base64::encode(&next_msg));
+    // noise.read_message(&next_msg, buf).unwrap();
 
     // Transition the state machine into transport mode now that the handshake is complete.
     let noise = noise.into_transport_mode().unwrap();
@@ -252,11 +273,22 @@ async fn responder_handshake(stream: &mut tokio::net::TcpStream, keypair: snow::
 }
 
 fn noise_params() -> NoiseParams {
+    // So the handshake patterns are different in WireGuard implementation and in the Example
+    // - IK
+    // - XX
+
+    // psk2 - means that pre-shared key is on position (?) 2?
+
     // Wireguard
-    // "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
+    "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
+
+    // let param = NoiseParams{
+    //
+    // }
+
 
     // Example
-    "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
+    // "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s".parse().unwrap()
 }
 
 fn generate_noise_keys() -> Result<snow::Keypair> {
@@ -331,6 +363,8 @@ mod tests {
         let server_keys = generate_noise_keys().expect("failed to generate server keys");
         let client_keys = generate_noise_keys().expect("failed to generate client keys");
 
+        let server_pub = server_keys.public.clone();
+
         tokio::spawn(async move {
             select! {
                 () = run_listener("0.0.0.0:8888", server_keys) => {
@@ -345,7 +379,7 @@ mod tests {
 
         let addr = "127.0.0.1:8888";
 
-        connect_to_peer(addr, client_keys).await;
+        connect_to_peer(addr, client_keys, &server_pub).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 

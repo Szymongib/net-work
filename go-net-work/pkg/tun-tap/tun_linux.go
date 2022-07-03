@@ -1,4 +1,4 @@
-package main
+package tun_tap
 
 import (
 	"os"
@@ -20,7 +20,7 @@ type ifReq struct {
 	pad   [0x28 - 0x10 - 2]byte
 }
 
-func openDev(config Config) (ifce *TunVInterface, err error) {
+func OpenDev(config Config) (ifce *TunVInterface, err error) {
 	var fdInt int
 	if fdInt, err = syscall.Open(
 		"/dev/net/tun", os.O_RDWR|syscall.O_NONBLOCK, 0); err != nil {

@@ -3,10 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"github.com/szymongib/net-work/go-net-work/pkg/ipcfg"
+	"github.com/szymongib/net-work/go-net-work/pkg/tun-tap"
 	"log"
 	"net"
 	"os"
-	"os/exec"
 )
 
 const (
@@ -24,13 +25,13 @@ func main() {
 	ifaceName := "tun9"
 	listenUDPPort := "4321"
 
-	cfg := Config{
+	cfg := tun_tap.Config{
 		Name:       ifaceName,
-		DeviceType: TUN,
-		Driver:     MacOSDriverSystem,
+		DeviceType: tun_tap.TUN,
+		Driver:     tun_tap.MacOSDriverSystem,
 	}
 
-	iface, err := openDev(cfg)
+	iface, err := tun_tap.OpenDev(cfg)
 	if err != nil {
 		panic(err)
 	}
@@ -43,7 +44,7 @@ func main() {
 		ip addr add 192.168.9.10⁄24 dev tun0
 		ip set dev tun0 up
 	*/
-	err = setupInterface(ifaceName)
+	err = ipcfg.SetupInterface(ifaceName, localIP)
 	if err != nil {
 		panic(err)
 	}
@@ -100,36 +101,4 @@ func main() {
 	scanner.Scan()
 	fmt.Println("Bye!")
 
-}
-
-func setupInterface(ifaceName string) error {
-	err := runIP("link", "set", "dev", ifaceName, "mtu", "1300")
-	if err != nil {
-		return fmt.Errorf("failed to set mtu: %w", err)
-	}
-
-	err = runIP("addr", "add", localIP, "dev", ifaceName)
-	if err != nil {
-		return fmt.Errorf("failed to set interface IP: %w", err)
-	}
-
-	err = runIP("link", "set", "dev", ifaceName, "up")
-	if err != nil {
-		return fmt.Errorf("failed to start up the interface: %w", err)
-	}
-
-	fmt.Println("Interface setup done.")
-	return nil
-}
-
-func runIP(args ...string) error {
-	cmd := exec.Command("ip", args...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-	cmd.Stdin = os.Stdin
-	err := cmd.Run()
-	if nil != err {
-		return fmt.Errorf("error running ip command: %w", err)
-	}
-	return nil
 }

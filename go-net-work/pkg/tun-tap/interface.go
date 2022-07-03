@@ -1,4 +1,4 @@
-package main
+package tun_tap
 
 import "io"
 

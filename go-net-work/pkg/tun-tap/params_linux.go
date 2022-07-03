@@ -1,4 +1,4 @@
-package main
+package tun_tap
 
 // DevicePermissions determines the owner and group owner for the newly created
 // interface.

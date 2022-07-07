@@ -25,6 +25,8 @@ import (
 // - Client needs to listen on UDP
 // - Server needs to send the "response" to the client
 
+const network = "172.16.0.0/24" // TODO: as a flag
+
 func main() {
 	app := &cli.App{
 		Name:  "vpnish",
@@ -166,12 +168,22 @@ func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, l
 			logger.Err(err).Msg("error while reading from UDP")
 			continue
 		}
+		fmt.Println("BYTES: ", buffer[:read])
 		flog := logger.With().Str("peer", addr.String()).Logger()
 		flog = extendLogWithPacketDetails(buffer[:read], flog)
 
 		flog.Info().Int("read", read).Msg("received UDP packets")
 
 		flog.Info().Msg("Writing to virtual interface")
+
+		// TODO: here parse IP packet and if destination address is not in the
+		// network, replace it with the "remoteAddr"?
+
+		//ipHeader, err := ipv4.ParseHeader(buffer[:read])
+		//if err != nil {
+		//	logger.Err(err).Msg("Failed to parse IP header")
+		//}
+		//ipHeader.Marshal()
 
 		// What you write to the network interface goes out to the routing
 		// table. **IT IS NOT READ FROM THIS INTERFACE BY iface.RWC.Read!**.

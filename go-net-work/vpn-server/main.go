@@ -6,6 +6,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/szymongib/net-work/go-net-work/pkg/ipcfg"
 	tun_tap "github.com/szymongib/net-work/go-net-work/pkg/tun-tap"
+	"github.com/szymongib/net-work/go-net-work/vpn-server/helpers"
 	"net"
 	"os"
 	"sync"
@@ -22,10 +23,10 @@ import (
 // TODO: configure this, so that packets reaching the server go further to their destination
 
 // TODO:
-// - Client needs to listen on UDP
-// - Server needs to send the "response" to the client
+// Perhaps I could create another tun interface on server to which I would forward the external packets?
+// Not sure how to solve it...
 
-const network = "172.16.0.0/24" // TODO: as a flag
+//const network = "172.16.0.0/24" // TODO: as a flag
 
 func main() {
 	app := &cli.App{
@@ -56,6 +57,10 @@ func main() {
 					&cli.StringFlag{
 						Name:  "ip",
 						Value: "172.16.0.1/24",
+					},
+					&cli.StringFlag{
+						Name:  "external-src-ip",
+						Value: "192.168.64.5",
 					},
 				},
 				Action: func(ctx *cli.Context) error {
@@ -99,18 +104,20 @@ func main() {
 }
 
 type PeerConfig struct {
-	EndpointAddr string
-	ListenAddr   string
-	LocalAddr    string
-	IP           string
+	EndpointAddr  string
+	ListenAddr    string
+	LocalAddr     string
+	IP            string
+	ExternalSrcIP string
 }
 
 func PeerConfigFromFlags(ctx *cli.Context) PeerConfig {
 	return PeerConfig{
-		ListenAddr:   ctx.String("addr"),
-		EndpointAddr: ctx.String("endpoint-addr"),
-		LocalAddr:    ctx.String("dial-addr"),
-		IP:           ctx.String("ip"),
+		ListenAddr:    ctx.String("addr"),
+		EndpointAddr:  ctx.String("endpoint-addr"),
+		LocalAddr:     ctx.String("dial-addr"),
+		IP:            ctx.String("ip"),
+		ExternalSrcIP: ctx.String("external-src-ip"),
 	}
 }
 
@@ -145,7 +152,17 @@ func runServer(cfg PeerConfig) error {
 		return errors.Wrap(err, "failed to startup UDP listener")
 	}
 
-	go udpReadAndForward(udpConn, iface, logger)
+	_, internalNet, err := net.ParseCIDR(cfg.IP)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse IP as CIDR")
+	}
+	outSrcIP := net.ParseIP(cfg.ExternalSrcIP)
+	logger.Info().
+		Str("internal-net", internalNet.String()).
+		Str("out-ip", outSrcIP.String()).
+		Msg("SWAP SETUP")
+
+	go udpReadAndForward(udpConn, iface, logger, SwapSrcForExternal(*internalNet, outSrcIP))
 	go tunReadAndForward(localAddr, endpointAddr, iface, logger)
 
 	wg := sync.WaitGroup{}
@@ -154,9 +171,17 @@ func runServer(cfg PeerConfig) error {
 	return nil
 }
 
+type ModifyPacket func(packet []byte) ([]byte, error)
+
+func SwapSrcForExternal(internalNet net.IPNet, newSrcIP net.IP) ModifyPacket {
+	return func(packet []byte) ([]byte, error) {
+		return helpers.SwapSrcIPv4OutsideNet(packet, internalNet, newSrcIP)
+	}
+}
+
 // udpReadAndForward reads packets from UDP connection and forwards them to the
 // virtual network interface.
-func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, logger zerolog.Logger) {
+func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, logger zerolog.Logger, mod ...ModifyPacket) {
 	buffer := make([]byte, 2048) // TODO: have no idea how big the buffer should be
 	logger = logger.With().Str("module", "udp-listener").Logger()
 	logger.Info().Str("addr", udpListener.LocalAddr().String()).
@@ -168,13 +193,8 @@ func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, l
 			logger.Err(err).Msg("error while reading from UDP")
 			continue
 		}
-		fmt.Println("BYTES: ", buffer[:read])
+		//fmt.Println("BYTES: ", buffer[:read])
 		flog := logger.With().Str("peer", addr.String()).Logger()
-		flog = extendLogWithPacketDetails(buffer[:read], flog)
-
-		flog.Info().Int("read", read).Msg("received UDP packets")
-
-		flog.Info().Msg("Writing to virtual interface")
 
 		// TODO: here parse IP packet and if destination address is not in the
 		// network, replace it with the "remoteAddr"?
@@ -185,9 +205,21 @@ func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, l
 		//}
 		//ipHeader.Marshal()
 
+		packet := buffer[:read]
+		//for _, m := range mod {
+		//	packet, err = m(packet)
+		//	if err != nil {
+		//		flog.Err(err).Msg("Failed to modify outgoing packet, dropping!")
+		//	}
+		//}
+
+		flog = extendLogWithPacketDetails(packet, flog)
+		flog.Info().Int("read", read).Msg("received UDP packets")
+		flog.Info().Msg("Writing to virtual interface")
+
 		// What you write to the network interface goes out to the routing
 		// table. **IT IS NOT READ FROM THIS INTERFACE BY iface.RWC.Read!**.
-		_, err = iface.RWC.Write(buffer[:read])
+		_, err = iface.RWC.Write(packet)
 		if err != nil {
 			flog.Err(err).Msg("error while writing to virtual interface")
 			continue

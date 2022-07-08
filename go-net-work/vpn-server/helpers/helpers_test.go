@@ -30,27 +30,44 @@ func TestIPPacket(t *testing.T) {
 }
 
 func TestSwapIPv4SrcAddr(t *testing.T) {
+	privateNet := net.IPNet{
+		IP:   net.IPv4(172, 16, 0, 0),
+		Mask: net.IPv4Mask(255, 128, 0, 0),
+	}
+	//outsideNet := net.IPNet{
+	//	IP:   net.IPv4(192, 64, 16, 0),
+	//	Mask: net.IPv4Mask(255, 255, 255, 0),
+	//}
+
 	// Initial source address is 172.16.0.2
 	for _, testCase := range []struct {
 		description string
 		rawPacket   []byte
+		isExternal  bool
 	}{
 		{
-			description: "udp packet",
-			rawPacket: []byte{
-				69, 0, 0, 60, 59, 102, 0, 0, 6, 17, 33, 40, 172, 16, 0, 2, 172, 16, 0, 1, 218, 205, 130, 169, 0, 40, 84, 254, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
-			},
+			description: "udp packet internal",
+			rawPacket:   []byte{69, 0, 0, 60, 59, 102, 0, 0, 6, 17, 33, 40, 172, 16, 0, 2, 172, 16, 0, 1, 218, 205, 130, 169, 0, 40, 84, 254, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95},
+			isExternal:  false,
 		},
 		{
-			description: "icmp (ping) packet",
-			rawPacket: []byte{
-				69, 0, 0, 84, 251, 249, 64, 0, 64, 1, 230, 139, 172, 16, 0, 2, 172, 16, 0, 1, 8, 0, 195, 53, 0, 21, 0, 1, 143, 143, 198, 98, 0, 0, 0, 0, 18, 239, 13, 0, 0, 0, 0, 0, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
-			},
+			description: "udp packet external",
+			rawPacket:   []byte{69, 0, 0, 60, 215, 108, 0, 0, 13, 17, 26, 35, 172, 16, 0, 2, 8, 8, 8, 8, 197, 0, 130, 191, 0, 40, 6, 183, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95},
+			isExternal:  true,
+		},
+		{
+			description: "icmp (ping) packet internal",
+			rawPacket:   []byte{69, 0, 0, 84, 143, 253, 64, 0, 64, 1, 82, 136, 172, 16, 0, 2, 172, 16, 0, 1, 8, 0, 95, 129, 0, 23, 0, 3, 233, 216, 199, 98, 0, 0, 0, 0, 33, 86, 7, 0, 0, 0, 0, 0, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55},
+			isExternal:  false,
+		},
+		{
+			description: "icmp (ping) packet external",
+			rawPacket:   []byte{69, 0, 0, 84, 251, 249, 64, 0, 64, 1, 230, 139, 172, 16, 0, 2, 172, 16, 0, 1, 8, 0, 195, 53, 0, 21, 0, 1, 143, 143, 198, 98, 0, 0, 0, 0, 18, 239, 13, 0, 0, 0, 0, 0, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55},
 		},
 		// TODO: test for TCP
 	} {
 		t.Run(testCase.description, func(t *testing.T) {
-			newPacket, err := SwapIPv4SrcAddr(testCase.rawPacket, net.IPv4(192, 64, 16, 1))
+			newPacket, err := SwapSrcIPv4OutsideNet(testCase.rawPacket, privateNet, net.IPv4(192, 64, 16, 1))
 			require.NoError(t, err)
 
 			modified := gopacket.NewPacket(newPacket, layers.LayerTypeIPv4, gopacket.Default)
@@ -58,7 +75,11 @@ func TestSwapIPv4SrcAddr(t *testing.T) {
 			ipv4Layer := networkL.(*layers.IPv4)
 
 			assert.Nil(t, modified.ErrorLayer())
-			assert.Equal(t, "192.64.16.1", ipv4Layer.SrcIP.String())
+			if testCase.isExternal {
+				assert.Equal(t, "192.64.16.1", ipv4Layer.SrcIP.String())
+			} else {
+				assert.Equal(t, "172.16.0.2", ipv4Layer.SrcIP.String())
+			}
 		})
 	}
 }

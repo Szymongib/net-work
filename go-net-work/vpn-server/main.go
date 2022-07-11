@@ -28,6 +28,16 @@ import (
 
 //const network = "172.16.0.0/24" // TODO: as a flag
 
+// TODO: GitHub ready:
+// - Eliminate the notion of client and server
+// - Read some config of peers
+// - Some basic encryption with Noise
+// - Pub Key routing?
+// - Cleanup the code
+
+// Open questions:
+// Do I need socket per tunnel? I do not think so
+
 func main() {
 	app := &cli.App{
 		Name:  "vpnish",
@@ -38,61 +48,29 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			{
-				Name:    "server",
+				Name:    "start",
 				Aliases: []string{"s"},
 				Usage:   "Go. And Serve.",
 				Flags: []cli.Flag{
 					&cli.StringFlag{
-						Name:  "addr",
-						Value: "0.0.0.0:55555",
+						Name:  "bee-config",
+						Value: "./bee-config.yaml",
 					},
 					&cli.StringFlag{
-						Name:  "dial-addr",
-						Value: "0.0.0.0:55510",
-					},
-					&cli.StringFlag{
-						Name:  "endpoint-addr",
-						Value: "192.168.64.8:55555",
-					},
-					&cli.StringFlag{
-						Name:  "ip",
-						Value: "172.16.0.1/24",
-					},
-					&cli.StringFlag{
-						Name:  "external-src-ip",
-						Value: "192.168.64.5",
+						Name:  "swarm-config",
+						Value: "./swarm-config.yaml",
 					},
 				},
 				Action: func(ctx *cli.Context) error {
-					cfg := PeerConfigFromFlags(ctx)
-					return runServer(cfg)
-				},
-			},
-			{
-				Name:    "client",
-				Aliases: []string{"c"},
-				Usage:   "You really need this?.",
-				Flags: []cli.Flag{
-					&cli.StringFlag{
-						Name:  "addr",
-						Value: "0.0.0.0:55555",
-					},
-					&cli.StringFlag{
-						Name:  "dial-addr",
-						Value: "0.0.0.0:55510",
-					},
-					&cli.StringFlag{
-						Name:  "endpoint-addr",
-						Value: "192.168.64.5:55555",
-					},
-					&cli.StringFlag{
-						Name:  "ip",
-						Value: "172.16.0.2/24",
-					},
-				},
-				Action: func(ctx *cli.Context) error {
-					clientCfg := PeerConfigFromFlags(ctx)
-					return runClient(clientCfg)
+					beeCfg, swarmCfg, err := LoadConfig(
+						ctx.String("bee-config"),
+						ctx.String("swarm-config"),
+					)
+					if err != nil {
+						return errors.Wrap(err, "failed to load config")
+					}
+
+					return runServer(beeCfg, swarmCfg)
 				},
 			},
 		},
@@ -121,28 +99,21 @@ func PeerConfigFromFlags(ctx *cli.Context) PeerConfig {
 	}
 }
 
-func runServer(cfg PeerConfig) error {
+func runServer(bee BeeConfig, swarm SwarmConfig) error {
 	zerolog.SetGlobalLevel(zerolog.TraceLevel)
 
 	logger := zerolog.New(os.Stdout)
-	logger.Info().Str("addr", cfg.ListenAddr).Msg("Preparing server...")
+	logger.Info().Str("addr", bee.ListenAddr).Msg("Preparing server...")
 
 	logger.Info().Msg("Creating network interface...")
-	iface, err := configureTUNInterface("tun666", cfg.IP, logger)
+	iface, err := configureTUNInterface(bee.IfaceName, bee.IfaceIP, logger)
 	if err != nil {
 		return errors.Wrap(err, "failed to configure virtual interface")
 	}
 
-	localAddr, err := net.ResolveUDPAddr("udp", cfg.LocalAddr)
-	if err != nil {
-		return errors.Wrap(err, "failed to resolve local UDP address")
-	}
-	endpointAddr, err := net.ResolveUDPAddr("udp", cfg.EndpointAddr)
-	if err != nil {
-		return errors.Wrap(err, "failed to resolve endpoint UDP addr")
-	}
+	// TODO: watch config and dynamically reload
 
-	listenAddr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
+	listenAddr, err := net.ResolveUDPAddr("udp", bee.ListenAddr)
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve listen UDP address")
 	}
@@ -152,17 +123,19 @@ func runServer(cfg PeerConfig) error {
 		return errors.Wrap(err, "failed to startup UDP listener")
 	}
 
-	_, internalNet, err := net.ParseCIDR(cfg.IP)
-	if err != nil {
-		return errors.Wrap(err, "failed to parse IP as CIDR")
-	}
-	outSrcIP := net.ParseIP(cfg.ExternalSrcIP)
-	logger.Info().
-		Str("internal-net", internalNet.String()).
-		Str("out-ip", outSrcIP.String()).
-		Msg("SWAP SETUP")
+	//_, internalNet, err := net.ParseCIDR(cfg.IP)
+	//if err != nil {
+	//	return errors.Wrap(err, "failed to parse IP as CIDR")
+	//}
+	//outSrcIP := net.ParseIP(cfg.ExternalSrcIP)
+	//logger.Info().
+	//	Str("internal-net", internalNet.String()).
+	//	Str("out-ip", outSrcIP.String()).
+	//	Msg("SWAP SETUP")
 
-	go udpReadAndForward(udpConn, iface, logger, SwapSrcForExternal(*internalNet, outSrcIP))
+	//swapMod := SwapSrcForExternal(*internalNet, outSrcIP)
+
+	go udpReadAndForward(udpConn, iface, logger)
 	go tunReadAndForward(localAddr, endpointAddr, iface, logger)
 
 	wg := sync.WaitGroup{}
@@ -193,17 +166,7 @@ func udpReadAndForward(udpListener *net.UDPConn, iface *tun_tap.TunVInterface, l
 			logger.Err(err).Msg("error while reading from UDP")
 			continue
 		}
-		//fmt.Println("BYTES: ", buffer[:read])
 		flog := logger.With().Str("peer", addr.String()).Logger()
-
-		// TODO: here parse IP packet and if destination address is not in the
-		// network, replace it with the "remoteAddr"?
-
-		//ipHeader, err := ipv4.ParseHeader(buffer[:read])
-		//if err != nil {
-		//	logger.Err(err).Msg("Failed to parse IP header")
-		//}
-		//ipHeader.Marshal()
 
 		packet := buffer[:read]
 		//for _, m := range mod {
@@ -252,6 +215,9 @@ func tunReadAndForward(localAddr, remoteAddr *net.UDPAddr, iface *tun_tap.TunVIn
 			}
 			flog := extendLogWithPacketDetails(buffer[:read], logger)
 
+			// TODO: here I need to read shit from network interface, parse IP
+			// header and decide where to send it.
+
 			flog.Info().Msg("Read from network interface, sending through UDP connection...")
 			_, err = udpConn.Write(buffer[:read])
 			if err != nil {
@@ -287,8 +253,6 @@ func runClient(cfg PeerConfig) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create virtual interface")
 	}
-
-	// TODO: configure routing here?
 
 	logger.Info().Msg("Starting up connection...")
 	err = endpointConnection(iface, cfg, logger)

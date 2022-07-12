@@ -1,0 +1,4 @@
+bee:
+  listenAddr: ":8000"
+  ifaceIP: "172.16.0.2/24"
+  ifaceName: "tun11"

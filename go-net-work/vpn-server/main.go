@@ -9,7 +9,8 @@ import (
 	"github.com/szymongib/net-work/go-net-work/vpn-server/helpers"
 	"net"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -105,6 +106,9 @@ func runServer(bee BeeConfig, swarm SwarmConfig) error {
 	logger := zerolog.New(os.Stdout)
 	logger.Info().Str("addr", bee.ListenAddr).Msg("Preparing server...")
 
+	fmt.Println("IFACE: ", bee.IfaceIP)
+	fmt.Println("IFACE: ", bee.IfaceName)
+
 	logger.Info().Msg("Creating network interface...")
 	iface, err := configureTUNInterface(bee.IfaceName, bee.IfaceIP, logger)
 	if err != nil {
@@ -113,34 +117,35 @@ func runServer(bee BeeConfig, swarm SwarmConfig) error {
 
 	// TODO: watch config and dynamically reload
 
+	//ip := net.ParseIP(bee.IfaceIP)
+	ip, _, err := net.ParseCIDR(bee.IfaceIP)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse CIDR")
+	}
+
+	// TODO: this IP I pass here might be incorrect
+	peerStore, err := InitializePeers(ip.String(), swarm.Peers, logger)
+	if err != nil {
+		return errors.Wrap(err, "failed to initialize peers")
+	}
+
 	listenAddr, err := net.ResolveUDPAddr("udp", bee.ListenAddr)
 	if err != nil {
-		return errors.Wrap(err, "failed to resolve listen UDP address")
+		return errors.Wrap(err, "failed to resolve listen address")
 	}
-
-	udpConn, err := net.ListenUDP("udp", listenAddr)
+	udpListener, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
-		return errors.Wrap(err, "failed to startup UDP listener")
+		return errors.Wrap(err, "failed to initialize UDP listener")
 	}
 
-	//_, internalNet, err := net.ParseCIDR(cfg.IP)
-	//if err != nil {
-	//	return errors.Wrap(err, "failed to parse IP as CIDR")
-	//}
-	//outSrcIP := net.ParseIP(cfg.ExternalSrcIP)
-	//logger.Info().
-	//	Str("internal-net", internalNet.String()).
-	//	Str("out-ip", outSrcIP.String()).
-	//	Msg("SWAP SETUP")
+	go forwardPackets(peerStore, iface, logger)
+	go udpReadAndForward(udpListener, iface, logger)
 
-	//swapMod := SwapSrcForExternal(*internalNet, outSrcIP)
+	sigChan := make(chan os.Signal)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	go udpReadAndForward(udpConn, iface, logger)
-	go tunReadAndForward(localAddr, endpointAddr, iface, logger)
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	wg.Wait()
+	sig := <-sigChan
+	logger.Info().Str("signal", sig.String()).Msg("Shutting down the application...")
 	return nil
 }
 

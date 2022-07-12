@@ -4,7 +4,6 @@ import (
 	"github.com/rs/zerolog"
 	tun_tap "github.com/szymongib/net-work/go-net-work/pkg/tun-tap"
 	"golang.org/x/net/ipv4"
-	"net/netip"
 )
 
 // TODO: so would one goroutine per peer be enough? Or is it possible to parallelize it further?
@@ -32,22 +31,23 @@ func forwardPackets(peerStore *PeerStore, iface *tun_tap.TunVInterface, logger z
 			continue
 		}
 
-		addr, ok := netip.AddrFromSlice(ipHeader.Dst)
-		if !ok {
-			logger.Warn().Msg("failed to parse IP address, dropping packet")
-			continue
-		}
+		//addr, ok := netip.AddrFromSlice(ipHeader.Dst)
+		//if !ok {
+		//	logger.Error().Msg("failed to parse IP address, dropping packet")
+		//	continue
+		//}
 
 		// TODO: here I need to read shit from network interface, parse IP
 		// header and decide where to send it.
 
-		peerID := PeerID(addr)
+		peerID := PeerID(ipHeader.Dst.To4().String())
+		flog := logger.With().Str("peer", peerID.String()).Logger()
 
-		logger.Debug().Str("peer", peerID.String()).Msg("Received packet for peer, forwarding...")
+		flog.Debug().Str("peer", peerID.String()).Msg("Received packet for peer, forwarding...")
 
 		err = peerStore.ForwardToPeer(packet, peerID)
 		if err != nil {
-			logger.Err(err).Msg("failed to forward packet to peer")
+			flog.Err(err).Msg("failed to forward packet to peer")
 			continue
 		}
 	}

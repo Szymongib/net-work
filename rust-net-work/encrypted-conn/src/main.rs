@@ -222,6 +222,8 @@ async fn handle_connection(keypair: snow::Keypair, peer: SocketAddr, mut stream:
         .await
         .expect("failed to perform responder handshake");
 
+    // TODO: change this to some proper reading
+    // TODO: if you read 0 bytes, this means that the other side disconnected and you should break
     while let Ok(msg) = recv(&mut stream).await {
         let len = noise.read_message(&msg, &mut buf).unwrap();
         println!("client said: {}", String::from_utf8_lossy(&buf[..len]));

@@ -2,4 +2,7 @@
 
 members = [
     "server",
+    "encrypted-conn",
+    "IKpsk2-noise",
+    "hole-puncher",
 ]
